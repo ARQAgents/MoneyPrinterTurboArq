@@ -1,0 +1,163 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Visual Spin</title>
+<style>
+  html, body { margin: 0; background: #000; height: 100%; overflow: hidden; }
+  canvas { display: block; margin: 0 auto; height: 100vh; aspect-ratio: 9 / 16; background: #000; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+// Visual Spin: four stippled ribbon arrows wrapped around a vertical cylinder,
+// spinning in alternating directions while the camera tilt breathes through
+// the horizon, which flips the perceived rotation direction.
+const W = 1080, H = 1920;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+const DURATION = 12;          // seconds, seamless loop
+const R = 330;                // cylinder radius
+const BAND = 120;             // band height
+const DOTS = 70000;           // stipple dots per arrow
+const FOCAL = 1900;           // perspective strength
+
+// deterministic RNG so every frame (and every render) is identical
+function rng(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6D2B79F5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Arrow outline in (u, v) space. u: 0..1 along the arc, v: -1..1 across the band.
+const HEAD_START = 0.68, HEAD_FLARE = 1.55;
+function halfWidth(u) {
+  if (u < HEAD_START) return 1;
+  const k = (u - HEAD_START) / (1 - HEAD_START);
+  return HEAD_FLARE * (1 - k);
+}
+function outline() {
+  const pts = [];
+  const N = 40;
+  for (let i = 0; i <= N; i++) pts.push([i / N * HEAD_START, 1]);
+  pts.push([HEAD_START, HEAD_FLARE]);
+  pts.push([1, 0]);
+  pts.push([HEAD_START, -HEAD_FLARE]);
+  pts.push([HEAD_START, -1]);
+  for (let i = N; i >= 0; i--) pts.push([i / N * HEAD_START, -1]);
+  pts.push([0, 1]);
+  return pts;
+}
+const OUTLINE = outline();
+
+const ARROWS = [
+  { color: [70, 90, 255],  dir:  1, y: -330, a0: 0.15 },
+  { color: [255, 40, 70],  dir: -1, y: -110, a0: 3.30 },
+  { color: [70, 90, 255],  dir:  1, y:  110, a0: 0.15 + Math.PI },
+  { color: [255, 40, 70],  dir: -1, y:  330, a0: 3.30 + Math.PI },
+];
+const SPAN = Math.PI * 1.35;  // arc length of each arrow
+
+// stipple samples inside the arrow shape
+ARROWS.forEach((a, idx) => {
+  const r = rng(1234 + idx * 77);
+  const us = new Float32Array(DOTS), vs = new Float32Array(DOTS), ph = new Float32Array(DOTS);
+  let n = 0;
+  while (n < DOTS) {
+    const u = r(), v = (r() * 2 - 1) * HEAD_FLARE;
+    if (Math.abs(v) <= halfWidth(u)) { us[n] = u; vs[n] = v; ph[n] = r(); n++; }
+  }
+  a.us = us; a.vs = vs; a.ph = ph;
+});
+
+function project(x, y, z, spin, tilt) {
+  // rotate around vertical axis
+  const cs = Math.cos(spin), sn = Math.sin(spin);
+  let X = x * cs + z * sn, Z = -x * sn + z * cs;
+  // tilt camera around X axis
+  const ct = Math.cos(tilt), st = Math.sin(tilt);
+  const Y = y * ct - Z * st;
+  const Z2 = y * st + Z * ct;
+  const s = FOCAL / (FOCAL + Z2);
+  return [W / 2 + X * s, H / 2 + Y * s, Z2, s];
+}
+
+function surface(a, u, v, spin, tilt) {
+  const theta = a.a0 + a.dir * u * SPAN;
+  const x = R * Math.cos(theta), z = R * Math.sin(theta);
+  const y = a.y + v * BAND / 2;
+  return project(x, y, z, spin, tilt);
+}
+
+function renderFrame(t) {
+  const phase = (t % DURATION) / DURATION;
+  const spin = phase * Math.PI * 2;
+  // tilt breathes through the horizon: flips top/bottom view, reverses perceived spin
+  const tilt = 0.5 * Math.sin(phase * Math.PI * 2);
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'lighter';
+
+  for (const a of ARROWS) {
+    const [cr, cg, cb] = a.color;
+
+    // stipple: back-facing dots are dimmer, shimmer subtly in time
+    const buckets = [[], [], []];
+    for (let i = 0; i < DOTS; i++) {
+      const p = surface(a, a.us[i], a.vs[i], spin, tilt);
+      const depth = Math.min(1, Math.max(0, (p[2] + R) / (2 * R))); // 0 near .. 1 far
+      const b = depth < 0.34 ? 0 : depth < 0.67 ? 1 : 2;
+      const tw = 0.5 + 0.5 * Math.sin(t * 6 + a.ph[i] * 40);
+      if (tw < 0.25) continue;
+      buckets[b].push(p[0], p[1]);
+    }
+    const alphas = [0.85, 0.6, 0.35];
+    buckets.forEach((arr, b) => {
+      ctx.fillStyle = `rgba(${cr},${cg},${cb},${alphas[b]})`;
+      ctx.beginPath();
+      for (let i = 0; i < arr.length; i += 2) ctx.rect(arr[i], arr[i + 1], 1.6, 1.6);
+      ctx.fill();
+    });
+
+    // glowing outline
+    ctx.beginPath();
+    OUTLINE.forEach(([u, v], i) => {
+      const p = surface(a, u, v, spin, tilt);
+      i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]);
+    });
+    ctx.lineJoin = 'round';
+    ctx.shadowColor = `rgb(${cr},${cg},${cb})`;
+    ctx.shadowBlur = 14;
+    ctx.strokeStyle = `rgba(${cr},${cg},${cb},0.95)`;
+    ctx.lineWidth = 2.2;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+window.renderFrame = renderFrame;
+window.DURATION = DURATION;
+
+// live preview when opened in a browser
+if (!location.search.includes('capture')) {
+  const start = performance.now();
+  (function loop(now) {
+    renderFrame((now - start) / 1000);
+    requestAnimationFrame(loop);
+  })(start);
+} else {
+  renderFrame(0);
+}
+</script>
+</body>
+</html>
